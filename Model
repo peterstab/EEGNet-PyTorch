@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+
+class ConstrainedConv2d(nn.Conv2d):
+    def __init__(self, *args, max_weight_norm=None, **kwargs):
+        super(ConstrainedConv2d, self).__init__(*args, **kwargs)
+        self.max_weight_norm = max_weight_norm
+
+    def forward(self, input):
+        weight = self.weight
+        weight_norm = torch.norm(weight.view(weight.size(0), -1), 2.0, dim=1)
+        if self.max_weight_norm is not None:
+            mask = weight_norm > self.max_weight_norm
+            if mask.any():
+                scaled_weights = torch.renorm(weight.view(weight.size(0), -1).clone(), 2, 0, self.max_weight_norm)
+                new_weight = weight.clone().view(weight.size(0), -1)
+                new_weight[mask] = scaled_weights[mask]
+                self.weight = nn.Parameter(new_weight.view_as(weight))
+        return F.conv2d(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
+
+class ConstrainedFC(nn.Linear):
+    def __init__(self, *args, max_weight_norm=None, **kwargs):
+        super(ConstrainedFC, self).__init__(*args, **kwargs)
+        self.max_weight_norm = max_weight_norm
+
+    def forward(self, input):
+        weight = self.weight
+        weight_norm = torch.norm(weight.view(weight.size(0), -1), 2.0, dim=1)
+        if self.max_weight_norm is not None:
+          
+            mask = weight_norm > self.max_weight_norm
+            if mask.any():
+                
+                scaled_weights = torch.renorm(weight.view(weight.size(0), -1).clone(), 2, 0, self.max_weight_norm)
+                new_weight = weight.clone().view(weight.size(0), -1)
+                new_weight[mask] = scaled_weights[mask]
+                self.weight = nn.Parameter(new_weight.view_as(weight))
+        
+        output = F.linear(input, self.weight, self.bias)
+        return F.softmax(output, dim=1)
+
+
+
+
+class EEGNet(nn.Module):
+  def __init__(self, nb_classes, chans, samples, dropoutRate, kernLength, F1, D, F2, norm_rate, norm_conv, pool, dropoutType = 'Dropout'):
+
+    if dropoutType == 'SpatialDropout2D':
+      dropoutType = nn.Dropout2d
+    elif dropoutType == 'Dropout':
+      dropoutType = nn.Dropout
+    else :
+      raise ValueError ('dropoutType must be one of SpatialDropout2D or Dropout, passed as a string')
+
+    super(EEGNet,self).__init__()
+    self.F2 = F2
+    self.samples = samples
+    self.pool = pool
+    self.conv1 = nn.Conv2d(in_channels=1, out_channels=F1, kernel_size=(1,kernLength), padding='same', bias = False)
+    self.bnorm1 = nn.BatchNorm2d(F1, momentum = 0.99, eps = 0.001)
+    self.avg1 = nn.AvgPool2d(kernel_size=(1,pool))
+    self.conv2 = ConstrainedConv2d(in_channels=F1, out_channels=D*F1, kernel_size=(chans,1), bias = False, groups=F1, max_weight_norm= norm_conv)
+    self.bnorm2 = nn.BatchNorm2d(D*F1,  momentum = 0.99, eps = 0.001)
+    self.drop1 = dropoutType(dropoutRate)
+    self.conv3 = nn.Conv2d(in_channels=D*F1, out_channels=D*F1, kernel_size=(1,round(16)), bias = False, padding='same', groups=D*F1)
+    self.conv4 = nn.Conv2d(in_channels=D*F1, out_channels = F2, kernel_size=(1,1), padding = 'same', bias = False)
+    self.bnorm3 = nn.BatchNorm2d(F2,  momentum = 0.99, eps = 0.001)
+    self.avg2 = nn.AvgPool2d(kernel_size=(1,2*pool))
+    self.drop2 = dropoutType(dropoutRate)
+
+    # Fully Connected Layer
+    t1 = samples/pool
+    t1 = math.floor(t1)
+    t1 = t1/(2*pool)
+    t1 = math.floor(t1)
+    t1 = round(t1)
+    self.fc1 = ConstrainedFC(in_features=F2 *t1, out_features = nb_classes, max_weight_norm = norm_rate)
+
+  def forward(self, X):
+    X = self.conv1(X)
+    X = self.bnorm1(X)
+    #print(X.shape)
+    X = self.conv2(X)
+    #print(X.shape)
+    X = self.bnorm2(X)
+    X = F.elu(X)
+    X = self.avg1(X)
+    X = self.drop1(X)
+    X = self.conv3(X)
+    X = self.conv4(X)
+    X = self.bnorm3(X)
+    X = F.elu(X)
+    X = self.avg2(X)
+    X = self.drop2(X)
+    X = X.permute(0,3,2,1)
+    t1 = self.samples/self.pool
+    t1 = math.floor(t1)
+    t1 = t1/(2*self.pool)
+    t1 = math.floor(t1)
+    t1 = round(t1)
+    X = X.reshape(-1, self.F2*t1)
+    X = self.fc1(X)
+    return X
+
+
+#----------------example:------------------------------------------------------------------
+f_new = 125
+max_lag = 15
+model = EEGNet(nb_classes=3, chans=31, samples=f_new*max_lag, dropoutRate=0.5, kernLength=round(f_new/2), F1=8, D=2,
+                 F2=16, norm_rate= 0.25, norm_conv=0.6, pool=4, dropoutType='Dropout')
